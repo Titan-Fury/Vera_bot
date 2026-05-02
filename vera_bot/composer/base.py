@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from pydantic import BaseModel, ValidationError, field_validator
+
 from ..config import COMPOSER_VERSION
+from .metrics import METRICS
 from .prompts import select_prompt
 from .providers.base import LLMProvider
 from .templates import try_template_compose
@@ -15,11 +19,15 @@ from .validators import (
     detect_auto_reply,
     detect_explicit_intent,
     detect_hard_no,
+    ensure_offer_in_catalog,
+    enforce_taboos,
+    has_payload_anchor,
     is_repeat,
     validate_outbound,
 )
 
 logger = logging.getLogger(__name__)
+_audit_logger = logging.getLogger("vera_bot.audit")
 
 
 @dataclass
@@ -76,6 +84,54 @@ def _parse_json_response(raw: str) -> Dict[str, Any]:
         raise
 
 
+_ALLOWED_CTA = {"open_ended", "binary_yes_no", "none"}
+_ALLOWED_SEND_AS = {"vera", "merchant_on_behalf"}
+_ALLOWED_ACTION = {"send", "wait", "end"}
+
+
+class CompositionJSON(BaseModel):
+    """Schema enforced on LLM output. One-shot retry if invalid."""
+
+    body: str = ""
+    cta: str = "open_ended"
+    send_as: Optional[str] = None
+    suppression_key: str = ""
+    rationale: str = ""
+    action: Optional[str] = None
+    wait_seconds: Optional[int] = None
+
+    @field_validator("cta")
+    @classmethod
+    def _cta_must_be_allowed(cls, v: str) -> str:
+        if v not in _ALLOWED_CTA:
+            return "open_ended"
+        return v
+
+    @field_validator("send_as")
+    @classmethod
+    def _send_as_allowed(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v in _ALLOWED_SEND_AS:
+            return v
+        return None
+
+    @field_validator("action")
+    @classmethod
+    def _action_allowed(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v in _ALLOWED_ACTION:
+            return v
+        return "send"
+
+
+_RETRY_SCHEMA_HINT = (
+    "Previous output was malformed. Return ONLY valid JSON matching this "
+    "schema and no prose: "
+    '{"body": "<= 320 chars", "cta": "open_ended|binary_yes_no|none", '
+    '"send_as": "vera|merchant_on_behalf", "suppression_key": "...", '
+    '"rationale": "..."'
+    ' , "action": "send|wait|end (replies only)", "wait_seconds": 60}'
+)
+
+
 class EngagementComposer:
     def __init__(self, provider: LLMProvider) -> None:
         self.provider = provider
@@ -88,10 +144,16 @@ class EngagementComposer:
         formatted_context: str,
         prior_outbound: Optional[List[str]] = None,
     ) -> Composition:
+        t_start = time.perf_counter()
         trigger = bundle.get("trigger") or {}
         kind = trigger.get("kind") or "default"
         is_customer_facing = bundle.get("customer") is not None
-        category_slug = (bundle.get("category") or {}).get("slug") or (bundle.get("merchant") or {}).get("category_slug")
+        category = bundle.get("category") or {}
+        merchant = bundle.get("merchant") or {}
+        customer = bundle.get("customer") or {}
+        category_slug = category.get("slug") or merchant.get("category_slug")
+        languages = self._resolve_languages(merchant, customer)
+        trigger_id = trigger.get("id") or "unknown"
 
         # Mechanical trigger kinds (templates.py) bypass the LLM entirely.
         templated = try_template_compose(bundle)
@@ -102,20 +164,42 @@ class EngagementComposer:
                 templated.flags.append("repeat_suppressed")
                 templated.body = ""
                 templated.rationale = f"[{COMPOSER_VERSION}] verbatim repeat suppressed"
+            self._audit(trigger_id, kind, "template", None, templated, t_start)
+            METRICS.record_compose(kind=kind, path="template", provider=None,
+                                   latency_ms=(time.perf_counter()-t_start)*1000, body=templated.body)
             return templated
 
         system_prompt, header = select_prompt(
             kind, is_customer_facing, is_reply=False, category_slug=category_slug,
+            languages=languages,
         )
         user_prompt = f"{header}\n\nCompose the next WhatsApp message.\n\n{formatted_context}"
 
-        comp = self._run(system_prompt, user_prompt, fallback_send_as="merchant_on_behalf" if is_customer_facing else "vera")
+        comp = self._run(system_prompt, user_prompt,
+                         fallback_send_as="merchant_on_behalf" if is_customer_facing else "vera")
         comp.send_as = comp.send_as or ("merchant_on_behalf" if is_customer_facing else "vera")
         if not comp.suppression_key:
-            comp.suppression_key = f"{trigger.get('id', 'unknown')}_{kind}"
+            comp.suppression_key = f"{trigger_id}_{kind}"
 
         comp.body, report = validate_outbound(comp.body)
         comp.flags.extend(report.flags)
+
+        # Offer-catalog grounding guard (brief §5.8 "Don't fabricate").
+        comp.body, offer_report = ensure_offer_in_catalog(
+            comp.body,
+            category.get("offer_catalog"),
+            merchant.get("offers"),
+        )
+        comp.flags.extend(offer_report.flags)
+
+        # Category-voice taboo enforcement (e.g. "cure"/"guaranteed" for dentists).
+        voice = (category.get("voice") or {})
+        comp.body, taboo_report = enforce_taboos(comp.body, voice.get("taboos"))
+        comp.flags.extend(taboo_report.flags)
+
+        # Payload-fact anchoring signal (audit only — we don't coerce).
+        if comp.body and not has_payload_anchor(comp.body, bundle):
+            comp.flags.append("no_payload_anchor")
 
         if prior_outbound and is_repeat(comp.body, prior_outbound):
             # Drop the action this tick rather than spend a second LLM call on
@@ -124,7 +208,47 @@ class EngagementComposer:
             comp.body = ""
             comp.rationale = f"[{COMPOSER_VERSION}] verbatim repeat suppressed"
 
+        path = "fallback" if "fallback" in comp.flags else "llm"
+        self._audit(trigger_id, kind, path, getattr(self.provider, "name", None), comp, t_start)
+        METRICS.record_compose(kind=kind, path=path,
+                               provider=getattr(self.provider, "name", None),
+                               latency_ms=(time.perf_counter()-t_start)*1000,
+                               body=comp.body)
         return comp
+
+    @staticmethod
+    def _resolve_languages(merchant: Dict[str, Any], customer: Dict[str, Any]) -> List[str]:
+        langs: List[str] = []
+        ident = (merchant or {}).get("identity") or {}
+        for l in ident.get("languages") or []:
+            if l:
+                langs.append(str(l))
+        if customer:
+            cident = customer.get("identity") or {}
+            pref = cident.get("language_pref")
+            if pref:
+                langs.append(str(pref))
+        return langs
+
+    @staticmethod
+    def _audit(trigger_id: str, kind: str, path: str, provider: Optional[str],
+               comp: "Composition", t_start: float) -> None:
+        record = {
+            "event": "compose",
+            "trigger_id": trigger_id,
+            "kind": kind,
+            "path": path,
+            "provider": provider,
+            "latency_ms": int((time.perf_counter() - t_start) * 1000),
+            "body_len": len(comp.body or ""),
+            "flags": list(comp.flags or []),
+            "cta": comp.cta,
+            "send_as": comp.send_as,
+        }
+        try:
+            _audit_logger.info(json.dumps(record, ensure_ascii=False))
+        except Exception:  # pragma: no cover — never let audit break composition
+            pass
 
     # ---- Reply (/v1/reply) ---------------------------------------------------
 
@@ -152,11 +276,16 @@ class EngagementComposer:
         kind = trigger.get("kind") or "default"
         is_customer_facing = bundle.get("customer") is not None
         intent_locked = detect_explicit_intent(inbound_message)
-        category_slug = (bundle.get("category") or {}).get("slug") or (bundle.get("merchant") or {}).get("category_slug")
+        category = bundle.get("category") or {}
+        merchant = bundle.get("merchant") or {}
+        customer = bundle.get("customer") or {}
+        category_slug = category.get("slug") or merchant.get("category_slug")
+        languages = self._resolve_languages(merchant, customer)
 
         system_prompt, header = select_prompt(
             kind, is_customer_facing, is_reply=True,
             has_chat_history=True, category_slug=category_slug,
+            languages=languages,
         )
         history_str = "\n[CHAT HISTORY]\n" + "\n".join(
             f"{t.get('from','?')}: {t.get('msg','')}" for t in chat_history
@@ -193,31 +322,66 @@ class EngagementComposer:
         is_reply: bool = False,
         fallback_send_as: str = "vera",
     ) -> Composition:
-        try:
-            raw = self.provider.generate(system_prompt, user_prompt)
-            data = _parse_json_response(raw)
-        except Exception as e:
-            logger.exception("LLM composition failed: %s", e)
+        t_start = time.perf_counter()
+        data = self._call_and_validate(system_prompt, user_prompt, t_start)
+        if data is None:
             return self._fallback(is_reply=is_reply, fallback_send_as=fallback_send_as)
 
         comp = Composition(
-            body=str(data.get("body") or ""),
-            cta=str(data.get("cta") or "open_ended"),
-            send_as=str(data.get("send_as") or fallback_send_as),
-            suppression_key=str(data.get("suppression_key") or ""),
-            rationale=str(data.get("rationale") or f"[{COMPOSER_VERSION}] (no rationale)"),
+            body=data.body or "",
+            cta=data.cta or "open_ended",
+            send_as=data.send_as or fallback_send_as,
+            suppression_key=data.suppression_key or "",
+            rationale=data.rationale or f"[{COMPOSER_VERSION}] (no rationale)",
         )
         if is_reply:
-            comp.action = str(data.get("action") or "send")
+            comp.action = data.action or "send"
             if comp.action == "wait":
                 try:
-                    comp.wait_seconds = int(data.get("wait_seconds") or 60)
+                    comp.wait_seconds = int(data.wait_seconds or 60)
                 except (TypeError, ValueError):
                     comp.wait_seconds = 60
 
         if not comp.rationale.startswith(f"[{COMPOSER_VERSION}]"):
             comp.rationale = f"[{COMPOSER_VERSION}] {comp.rationale}".strip()
         return comp
+
+    # Budget gate for the one-shot retry — keeps us inside the /v1/tick 10s
+    # timeout even when the first generate() burned most of the window.
+    _RETRY_MIN_BUDGET_S = 2.5
+    # A compose() call has ~8s realistic budget (tick=10s minus housekeeping).
+    # Anything slower than this and we should give up, not retry.
+    _RETRY_SOFT_DEADLINE_S = 8.0
+
+    def _call_and_validate(
+        self, system_prompt: str, user_prompt: str, t_start: float,
+    ) -> Optional[CompositionJSON]:
+        try:
+            raw = self.provider.generate(system_prompt, user_prompt)
+            return CompositionJSON(**_parse_json_response(raw))
+        except (json.JSONDecodeError, ValidationError) as e:
+            elapsed = time.perf_counter() - t_start
+            remaining = self._RETRY_SOFT_DEADLINE_S - elapsed
+            if remaining < self._RETRY_MIN_BUDGET_S:
+                logger.info(
+                    "LLM JSON invalid and no budget for retry "
+                    "(elapsed=%.2fs, need>=%.2fs): %s",
+                    elapsed, self._RETRY_MIN_BUDGET_S, str(e)[:200],
+                )
+                return None
+            try:
+                retry_prompt = f"{user_prompt}\n\n[RETRY] {_RETRY_SCHEMA_HINT}"
+                raw = self.provider.generate(system_prompt, retry_prompt)
+                return CompositionJSON(**_parse_json_response(raw))
+            except Exception as retry_err:
+                logger.warning(
+                    "LLM retry also failed (%s); falling back",
+                    type(retry_err).__name__,
+                )
+                return None
+        except Exception as e:
+            logger.exception("LLM composition failed: %s", e)
+            return None
 
     def _fallback(self, *, is_reply: bool, fallback_send_as: str) -> Composition:
         if is_reply:

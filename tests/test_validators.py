@@ -6,6 +6,9 @@ from vera_bot.composer.validators import (
     detect_explicit_intent,
     detect_hard_no,
     enforce_length,
+    enforce_taboos,
+    ensure_offer_in_catalog,
+    has_payload_anchor,
     is_repeat,
     strip_urls,
     validate_outbound,
@@ -70,3 +73,71 @@ def test_detect_auto_reply_triple_repeat():
 def test_detect_auto_reply_canned_phrase():
     assert detect_auto_reply(["Thank you for contacting our team!"])
     assert not detect_auto_reply(["Hi, who is this"])
+
+
+def test_is_repeat_catches_fuzzy_rephrase():
+    """0.92+ similarity should trip — catches "rephrased repeats"."""
+    prior = ["Calls down 40% vs last 7d. Want to boost? Reply YES/NO."]
+    # Tiny punctuation / casing tweak → should still flag as repeat.
+    assert is_repeat("Calls down 40% vs last 7d! Want to boost? Reply yes/no", prior)
+    # Genuinely different message → should NOT flag.
+    assert not is_repeat("Views up 32% — want to extend the push?", prior)
+
+
+def test_ensure_offer_in_catalog_strips_invented():
+    catalog = [{"title": "Dental Cleaning @ ₹299"}]
+    body = "Want to try our Diwali Glow Bundle @ ₹899? Reply YES/NO."
+    out, r = ensure_offer_in_catalog(body, catalog, None)
+    assert "invented_offer_dropped" in r.flags
+    assert "Diwali Glow Bundle @ ₹899" not in out
+
+
+def test_ensure_offer_in_catalog_allows_grounded():
+    catalog = [{"title": "Dental Cleaning @ ₹299"}]
+    body = "Dental Cleaning @ ₹299 is open Wed 6pm. Book it? Reply YES/NO."
+    out, r = ensure_offer_in_catalog(body, catalog, None)
+    assert "invented_offer_dropped" not in r.flags
+    assert out == body
+
+
+def test_ensure_offer_in_catalog_no_catalog_is_noop():
+    out, r = ensure_offer_in_catalog("Haircut @ ₹99 available.", None, None)
+    assert r.flags == []
+
+
+def test_enforce_taboos_strips_and_flags():
+    out, r = enforce_taboos("We guaranteed a cure for your cavity.", ["cure", "guaranteed"])
+    assert "guaranteed" not in out.lower()
+    assert "cure" not in out.lower()
+    assert any(f.startswith("taboos_stripped:") for f in r.flags)
+
+
+def test_enforce_taboos_empty_taboos_is_noop():
+    out, r = enforce_taboos("Hello there", [])
+    assert out == "Hello there"
+    assert r.flags == []
+
+
+def test_has_payload_anchor_number_match():
+    bundle = {
+        "trigger": {"payload": {"metric": "calls", "delta_pct": 0.28}},
+        "merchant": {"identity": {"name": "Tandoor House"}},
+    }
+    assert has_payload_anchor("Calls up 28% — nice run", bundle)
+
+
+def test_has_payload_anchor_named_entity():
+    bundle = {
+        "trigger": {"payload": {}},
+        "merchant": {"identity": {"name": "Tandoor House"}},
+        "category": {"digest": [{"title": "JIDA Oct 2026 fluoride trial"}]},
+    }
+    assert has_payload_anchor("JIDA Oct 2026: 38% better caries outcomes.", bundle)
+
+
+def test_has_payload_anchor_miss():
+    bundle = {
+        "trigger": {"payload": {"metric": "calls", "delta_pct": 0.4}},
+        "merchant": {"identity": {"name": "Tandoor House"}},
+    }
+    assert not has_payload_anchor("Generic nudge without any anchor.", bundle)

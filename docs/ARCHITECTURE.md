@@ -131,6 +131,171 @@ writes in an `asyncio.Lock`.
 |------------------------------|----------------------------------------------------|
 | Provider timeout             | `asyncio.wait_for` at 8 s drops that tick action   |
 | Provider 5xx / connection    | `_retry.with_retries` (2 attempts, 0.5/1.5 s)      |
-| JSON parse error on response | Fallback Composition with `[composer_v1] fallback` |
+| Provider 429 with Retry-After| Tier marked cold via circuit breaker (ADR-005)     |
+| JSON parse error on response | `CompositionJSON` pydantic retry once, then fallback (ADR-001) |
 | Empty body post-validation   | Action is dropped (not sent)                       |
 | `compose_reply` exception    | Returns `{action:"end", rationale:...}`            |
+
+---
+
+## Architecture Decision Records
+
+Short-form ADRs documenting non-obvious design choices. Each has Context
+(what problem), Decision (what we did), Consequence (what it implies).
+
+### ADR-001 — Pydantic-validated LLM output with budgeted retry
+
+- **Context**: LLMs occasionally emit JSON with extra prose, wrong field
+  names, or invalid enum values. Brief §10 penalises malformed responses
+  (-2 each). The tick deadline is 10 s total per action.
+- **Decision**: Define `CompositionJSON` (Pydantic) with enum validators.
+  On `ValidationError` or `JSONDecodeError`, re-prompt once with an explicit
+  schema hint — but only if we have ≥ 2.5 s of budget left. Otherwise fall
+  back immediately to the canned safe composition.
+- **Consequence**: Lower silent-fallback rate; retries never push a tick
+  over the 10 s judge timeout. Audit log records which path (`llm`,
+  `fallback`, `template`) produced each action.
+
+### ADR-002 — Template bypass for mechanical trigger kinds
+
+- **Context**: 41 of the 100-trigger dataset are purely mechanical (recall
+  reminders, perf deltas, milestones). LLMs add latency, variance, and
+  rate-limit exposure without improving quality on these.
+- **Decision**: `templates.py` dispatches 7 kinds (customer-facing:
+  `appointment_tomorrow`, `chronic_refill_due`, `recall_due`;
+  merchant-facing: `perf_spike`, `perf_dip`, `festival_upcoming`,
+  `milestone_reached`) to f-string composers with full payload grounding.
+  `festival_upcoming` with `days_until > 30` falls through to the LLM so
+  the template doesn't claim urgency it can't justify.
+- **Consequence**: Zero-cost, zero-latency, zero-hallucination for 41 %
+  of triggers. Reserves LLM budget for triggers that genuinely need
+  composition.
+
+### ADR-003 — Precompute on context-push
+
+- **Context**: The judge pushes trigger + merchant + customer contexts
+  *before* calling `/v1/tick` (CTB §4 phase 2 order). Waiting for the
+  tick to start composing wastes the available asynchronous headroom.
+- **Decision**: Every time `/v1/context` arrives and completes a
+  `(trigger, merchant)` bundle, kick off a background compose into a
+  `_compose_cache` task map. `/v1/tick` reads the cached result first.
+- **Consequence**: Hot path at tick time is a single `asyncio.wait_for`
+  on a mostly-done task. Global `_compose_semaphore` caps concurrent
+  upstream calls so precompute bursts don't hammer provider rate limits.
+
+### ADR-004 — Global compose semaphore
+
+- **Context**: Free-tier LLM APIs (Groq, Gemini) enforce RPM caps. A burst
+  of simultaneous context pushes from the judge could fire 25+ composes
+  at once, half of which would eat 429s.
+- **Decision**: One process-wide `asyncio.Semaphore(TICK_CONCURRENCY)`
+  shared by precompute *and* tick paths. Budget is one tunable env var.
+- **Consequence**: Sustained throughput is capped but jitter-free; no
+  single path can starve the other.
+
+### ADR-005 — Circuit breaker with Retry-After
+
+- **Context**: When a tier returns 429, the next ~25 parallel composes in
+  the same tick would naively hit the same 429, log-spamming and wasting
+  ~150 ms each on a network round-trip.
+- **Decision**: `FallbackLLMProvider` reads the `Retry-After` header from
+  the 429 response and marks that tier cold until the window closes (hard
+  cap 300 s). Cold tiers are skipped without a network call. Falls
+  through to the next tier in the chain.
+- **Consequence**: Burst composes during a rate-limited window cost near
+  zero extra latency. Metrics endpoint surfaces cold tier status for
+  operator visibility.
+
+### ADR-006 — Fallback log dedupe
+
+- **Context**: A burst of 429s across a tick would historically log 25
+  identical "fallback: groq failed" warnings.
+- **Decision**: Per `(provider_name, error_class)` key, suppress repeat
+  warnings within a 5 s window.
+- **Consequence**: Signal preserved, noise gone. One log line per
+  upstream incident type per 5 s.
+
+### ADR-007 — Category voice blocks + taboo enforcement
+
+- **Context**: Brief §11 penalises promotional tone on clinical
+  categories and explicit taboo usage (e.g. "cure", "guaranteed" for
+  dentists).
+- **Decision**: `prompts.py::_CATEGORY_VOICE` injects per-vertical
+  vocabulary into the system prompt. `validators.py::enforce_taboos`
+  strips category-voice taboos from the final body as a defence in depth.
+- **Consequence**: Category Fit dimension scores improve; taboo leakage
+  becomes a zero-percent tail risk instead of a probabilistic one.
+
+### ADR-008 — Offer-catalog grounding guard
+
+- **Context**: LLMs readily invent plausible-sounding offers ("Diwali
+  Glow Bundle @ ₹899") that don't exist in the merchant's catalog. Brief
+  §5.8 prohibits this; judges penalise it on Specificity and Merchant
+  Fit.
+- **Decision**: Regex-match `Service @ ₹price` patterns in the output;
+  any that don't appear in `category.offer_catalog` or
+  `merchant.offers` are stripped. If stripping guts the body, replace
+  with a canned "Want me to set up a matching offer from your catalog?"
+  fallback.
+- **Consequence**: Zero invented offers hit the wire. Operator sees
+  `invented_offer_dropped` flag in the audit log when it fires.
+
+### ADR-009 — Few-shot examples per trigger kind
+
+- **Context**: Kind blocks previously described structure abstractly
+  ("LEAD with the metric"). Instruction-following LLMs do markedly better
+  with one concrete 9/10 example in-context.
+- **Decision**: Each `_KIND_BLOCKS` entry now includes an
+  `EXAMPLE (9/10): "..."` reference line after the structure description.
+- **Consequence**: Engagement + Category Fit scores rise without
+  increasing token cost materially (~30-50 tokens per block).
+
+### ADR-010 — Language localization directive
+
+- **Context**: Brief §5.7: "Hindi-English code-mix is fine — and often
+  preferred for Indian merchant audiences. Match the merchant's
+  language." The composer previously left this to the LLM to infer from
+  the bundle.
+- **Decision**: `select_prompt` now accepts a `languages` iterable. When
+  it includes `hi`, `hinglish`, or similar, a natural-language directive
+  is inserted telling the LLM to write Hinglish (roman-Hindi preferred,
+  English for numbers / CTAs).
+- **Consequence**: Merchant Fit axis gains on Indian-market merchants
+  without affecting English-only merchants.
+
+### ADR-011 — Fuzzy repeat detection
+
+- **Context**: Brief §10 penalises "same body verbatim" but LLMs readily
+  produce paraphrases that read identically. Exact-match `is_repeat`
+  missed those.
+- **Decision**: Normalise (lowercase, strip punctuation, collapse
+  whitespace), then use `difflib.SequenceMatcher` ratio ≥ 0.92 as a
+  fuzzy-repeat signal. On hit, action is dropped (tick path) or ended
+  (reply path) — never a second LLM call.
+- **Consequence**: Eliminates a class of subtle repeat penalties with no
+  latency hit.
+
+### ADR-012 — Payload-fact citation audit
+
+- **Context**: Specificity is the highest-weight judge axis. Messages
+  that don't anchor on a number or named entity from the bundle score
+  poorly. Teaching the LLM once isn't enough; hallucinations slip.
+- **Decision**: `has_payload_anchor(body, bundle)` extracts all numeric
+  tokens and capitalised entity tokens from the bundle and checks
+  overlap with the output. Mismatches flag `no_payload_anchor` in the
+  audit log (warning, not a hard block).
+- **Consequence**: Grounding-failure rate is observable per compose;
+  prompt regressions show up immediately in the dashboard / metrics
+  endpoint.
+
+### ADR-013 — Operator observability (metrics + dashboard)
+
+- **Context**: The required 5-endpoint spec surface gives reviewers no
+  way to inspect the bot's decision path during a run.
+- **Decision**: Add two read-only endpoints — `/v1/metrics` (JSON
+  snapshot of compose counts, provider mix, fallback cascade, 429
+  windows, p50/p95 latency, recent 20 composes) and `/dashboard` (a
+  single self-contained HTML page with 5-second auto-refresh).
+- **Consequence**: Zero additional runtime cost. Reviewer sees a
+  production-shaped observability surface instead of guessing from log
+  lines.

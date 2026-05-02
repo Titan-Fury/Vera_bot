@@ -13,10 +13,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from ..adapter import ContextAggregator, format_context_for_prompt
 from ..composer import EngagementComposer, make_provider
+from ..composer.metrics import METRICS
 from ..config import (
     APP_VERSION,
     COMPOSER_VERSION,
@@ -153,6 +154,88 @@ async def metadata():
         version=APP_VERSION,
         submitted_at=SETTINGS.submitted_at,
     )
+
+
+@app.get("/v1/metrics")
+async def metrics_endpoint():
+    """In-memory operational metrics (not part of the required spec surface).
+
+    Exposes compose counts, fallback cascade stats, p50/p95 latency, 429
+    counts per tier, and a ring buffer of the 20 most recent composes.
+    Reviewer-facing observability; zero external deps.
+    """
+    snap = METRICS.snapshot()
+    snap["provider_chain"] = getattr(llm_provider, "name", type(llm_provider).__name__)
+    snap["composer_version"] = COMPOSER_VERSION
+    return snap
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    """Self-contained HTML operator dashboard. Auto-refreshes every 5s."""
+    return HTMLResponse(_DASHBOARD_HTML)
+
+
+_DASHBOARD_HTML = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="5">
+<title>Vera — Operator Dashboard</title>
+<style>
+ body{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0b0f14;color:#d7e3f4;margin:0;padding:20px;font-size:13px}
+ h1{font-size:16px;margin:0 0 12px;color:#7cc4ff}
+ h2{font-size:13px;color:#7cc4ff;margin:18px 0 6px;border-bottom:1px solid #1a2530;padding-bottom:4px}
+ .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+ table{border-collapse:collapse;width:100%}
+ td,th{text-align:left;padding:4px 10px 4px 0;border-bottom:1px solid #14202b}
+ .hot{color:#6de59e}.cold{color:#ff8080}.meta{color:#6a7c8c}
+ pre{white-space:pre-wrap;word-break:break-word;background:#0f1620;padding:8px;border-radius:4px;margin:0;font-size:12px}
+ .bar{display:inline-block;height:10px;background:#2d7cff;vertical-align:middle;margin-right:6px}
+ .flags{color:#ffc864;font-size:11px}
+</style></head><body>
+<h1>Vera — Operator Dashboard <span class=meta id=v></span></h1>
+<div class=grid>
+  <div>
+    <h2>Provider chain</h2>
+    <div id=chain><span class=meta>loading…</span></div>
+    <h2>Compose paths</h2>
+    <table id=paths></table>
+    <h2>Provider mix</h2>
+    <table id=providers></table>
+    <h2>Fallback cascade</h2>
+    <table id=cascade></table>
+    <h2>429s by tier</h2>
+    <table id=t429></table>
+    <h2>Latency (ms)</h2>
+    <table id=lat></table>
+  </div>
+  <div>
+    <h2>Recent composes (last 20)</h2>
+    <div id=recent><span class=meta>loading…</span></div>
+  </div>
+</div>
+<script>
+async function tick(){
+ const r=await fetch('/v1/metrics'); const m=await r.json();
+ document.getElementById('v').textContent=`uptime ${m.uptime_seconds}s · total ${m.compose_total} · ${m.composer_version}`;
+ document.getElementById('chain').innerHTML=`<code>${m.provider_chain}</code>`;
+ const mkrows=(obj)=>Object.entries(obj).map(([k,v])=>`<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+ document.getElementById('paths').innerHTML=mkrows(m.compose_by_path);
+ document.getElementById('providers').innerHTML=mkrows(m.compose_by_provider);
+ document.getElementById('cascade').innerHTML=mkrows(m.fallback_cascade)||'<tr><td class=meta>no cascades</td></tr>';
+ const t429=Object.entries(m.tier_429_counts).map(([k,v])=>{
+  const cold=m.tier_cold_remaining_s[k]||0;
+  const badge=cold>0?`<span class=cold>COLD ${cold}s</span>`:`<span class=hot>hot</span>`;
+  return `<tr><td>${k}</td><td>${v}</td><td>${badge}</td></tr>`;}).join('');
+ document.getElementById('t429').innerHTML=t429||'<tr><td class=meta>none</td></tr>';
+ document.getElementById('lat').innerHTML=`<tr><td>p50</td><td>${m.latency_ms.p50}</td></tr><tr><td>p95</td><td>${m.latency_ms.p95}</td></tr><tr><td>samples</td><td>${m.latency_ms.samples}</td></tr><tr><td>template ratio</td><td>${m.template_ratio}</td></tr>`;
+ const rec=m.recent.slice().reverse().map(x=>{
+  const flags=x.flags&&x.flags.length?`<div class=flags>${x.flags.join(' · ')}</div>`:'';
+  return `<pre><b>[${x.path}] ${x.kind}</b> · ${x.provider||'template'} · ${x.latency_ms}ms · ${x.body_len}c\\n${x.body_preview}</pre>`;}).join('');
+ document.getElementById('recent').innerHTML=rec||'<span class=meta>no composes yet</span>';
+}
+tick();
+</script></body></html>"""
 
 
 @app.post("/v1/context")

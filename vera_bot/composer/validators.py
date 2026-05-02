@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Iterable, List, Tuple
+from difflib import SequenceMatcher
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 from ..config import MAX_BODY_CHARS
 
@@ -117,11 +118,195 @@ def validate_outbound(body: str) -> Tuple[str, ValidationReport]:
     return body, report
 
 
-def is_repeat(body: str, prior_outbound: Iterable[str]) -> bool:
-    needle = body.strip().lower()
+def is_repeat(body: str, prior_outbound: Iterable[str], similarity_threshold: float = 0.92) -> bool:
+    """Detect verbatim OR near-duplicate repeats.
+
+    Brief §10 penalises "same body verbatim" but the judge's LLM may rephrase
+    in subtle ways. We flag above `similarity_threshold` Levenshtein-ratio
+    normalised similarity to catch "rephrased repeats" without a second LLM
+    call.
+    """
+    needle = _norm_for_compare(body)
     if not needle:
         return False
-    return any(needle == (p or "").strip().lower() for p in prior_outbound)
+    for p in prior_outbound:
+        cand = _norm_for_compare(p or "")
+        if not cand:
+            continue
+        if needle == cand:
+            return True
+        # SequenceMatcher ratio is a good proxy for normalised Levenshtein on
+        # short WhatsApp bodies (<320 chars).
+        if SequenceMatcher(None, needle, cand).ratio() >= similarity_threshold:
+            return True
+    return False
+
+
+_WHITESPACE_RE = re.compile(r"\s+")
+_PUNCT_RE = re.compile(r"[^\w\s]")
+
+
+def _norm_for_compare(s: str) -> str:
+    if not s:
+        return ""
+    s = _PUNCT_RE.sub(" ", s.lower())
+    return _WHITESPACE_RE.sub(" ", s).strip()
+
+
+# ---- offer-catalog grounding --------------------------------------------------
+
+# Service+price patterns like "Dental Cleaning @ ₹299" or "Haircut @ ₹99".
+_OFFER_LIKE_RE = re.compile(
+    r"[A-Za-z][A-Za-z \-/&+]{2,40}\s*@\s*₹\s*[\d,]+",
+    re.UNICODE,
+)
+
+
+def ensure_offer_in_catalog(
+    body: str,
+    offer_catalog: Sequence[Dict[str, Any]] | None,
+    merchant_offers: Sequence[Dict[str, Any]] | None = None,
+) -> Tuple[str, ValidationReport]:
+    """Strip invented "Service @ ₹price" phrases not found in catalog or merchant offers.
+
+    Brief §5.8: "Don't fabricate — no fake offers". Protects specificity
+    + merchant-fit scores. Leaves pure money mentions ("₹299") alone; only
+    challenges full Service+Price patterns.
+    """
+    r = ValidationReport()
+    if not body:
+        return body, r
+
+    allowed_titles: set[str] = set()
+    for item in list(offer_catalog or []) + list(merchant_offers or []):
+        if not isinstance(item, dict):
+            continue
+        title = (item.get("title") or "").strip()
+        if title:
+            allowed_titles.add(_norm_for_compare(title))
+
+    if not allowed_titles:
+        # No catalog context — can't validate; trust the LLM.
+        return body, r
+
+    matches = _OFFER_LIKE_RE.findall(body)
+    if not matches:
+        return body, r
+
+    invented: List[str] = []
+    for m in matches:
+        norm = _norm_for_compare(m)
+        # A proposed offer is "grounded" if its normalized form appears as a
+        # substring of any catalog title or vice-versa (tolerates tweaks like
+        # missing articles).
+        grounded = any(norm == t or norm in t or t in norm for t in allowed_titles)
+        if not grounded:
+            invented.append(m)
+
+    if not invented:
+        return body, r
+
+    r.add("invented_offer_dropped")
+    out = body
+    for inv in invented:
+        out = out.replace(inv, "")
+    out = re.sub(r"\s{2,}", " ", out).strip(" ,.—-")
+    # If we gutted the body, surface a canned ask instead.
+    if len(out) < 30:
+        out = "Want me to set up a matching offer from your catalog? Reply YES or NO."
+        r.add("invented_offer_fallback")
+    return out, r
+
+
+# ---- taboo enforcement --------------------------------------------------------
+
+
+def enforce_taboos(body: str, taboos: Iterable[str] | None) -> Tuple[str, ValidationReport]:
+    """Strip category-voice taboos (e.g. "cure", "guaranteed" for dentists)."""
+    r = ValidationReport()
+    if not body or not taboos:
+        return body, r
+    out = body
+    hits: List[str] = []
+    for tab in taboos:
+        if not tab:
+            continue
+        pattern = re.compile(r"\b" + re.escape(str(tab)) + r"\b", re.IGNORECASE)
+        if pattern.search(out):
+            out = pattern.sub("", out)
+            hits.append(str(tab))
+    if hits:
+        out = re.sub(r"\s{2,}", " ", out).strip(" ,.—-")
+        r.add(f"taboos_stripped:{','.join(sorted(set(hits)))}")
+    return out, r
+
+
+# ---- payload-fact citation check ---------------------------------------------
+
+_NUMBERS_RE = re.compile(r"(?:₹\s?)?\b\d+(?:[,.]\d+)?%?\b")
+_CAP_TOKEN_RE = re.compile(r"\b[A-Z][A-Za-z0-9]{2,}\b")  # named entities / acronyms
+
+
+def _extract_anchor_tokens(value: Any, out: set[str]) -> None:
+    """Recursively extract numeric + capitalised-word tokens from context values."""
+    if value is None:
+        return
+    if isinstance(value, dict):
+        for v in value.values():
+            _extract_anchor_tokens(v, out)
+        return
+    if isinstance(value, (list, tuple, set)):
+        for v in value:
+            _extract_anchor_tokens(v, out)
+        return
+    # Floats between 0 and 1 are usually percentage ratios (delta_pct=0.28).
+    # Add the "28" form so the LLM's natural "up 28%" phrasing matches.
+    if isinstance(value, float) and 0.0 < abs(value) <= 1.0:
+        pct = int(round(abs(value) * 100))
+        if pct:
+            out.add(str(pct))
+    s = str(value)
+    for n in _NUMBERS_RE.findall(s):
+        clean = n.replace(" ", "").replace("₹", "").replace(",", "").rstrip("%")
+        if clean:
+            out.add(clean)
+    for t in _CAP_TOKEN_RE.findall(s):
+        if len(t) >= 3:
+            out.add(t)
+
+
+def has_payload_anchor(body: str, bundle: Dict[str, Any] | None) -> bool:
+    """True if `body` cites at least one number/named-entity drawn from the bundle.
+
+    Brief §5.5 "Specificity wins" + §11 "hallucinated data" anti-pattern. We
+    don't require a match (too strict for warm customer messages), but the
+    composer flags a miss so the engineer sees low-grounding outputs in the
+    audit log.
+    """
+    if not body or not bundle:
+        return False
+    anchors: set[str] = set()
+    _extract_anchor_tokens(bundle.get("trigger"), anchors)
+    _extract_anchor_tokens(bundle.get("merchant"), anchors)
+    _extract_anchor_tokens(bundle.get("customer"), anchors)
+    # Only category-digest anchors (not the whole vertical taxonomy which
+    # would spuriously match any capitalised vocab term).
+    cat = bundle.get("category") or {}
+    if isinstance(cat, dict):
+        _extract_anchor_tokens(cat.get("digest"), anchors)
+        _extract_anchor_tokens(cat.get("offer_catalog"), anchors)
+        _extract_anchor_tokens(cat.get("peer_stats"), anchors)
+        _extract_anchor_tokens(cat.get("seasonal_beats"), anchors)
+        _extract_anchor_tokens(cat.get("trend_signals"), anchors)
+    if not anchors:
+        return False
+    body_tokens_num = {m.replace(",", "").rstrip("%") for m in _NUMBERS_RE.findall(body)}
+    body_tokens_cap = set(_CAP_TOKEN_RE.findall(body))
+    if body_tokens_num & anchors:
+        return True
+    if body_tokens_cap & anchors:
+        return True
+    return False
 
 
 def detect_hard_no(message: str) -> bool:
