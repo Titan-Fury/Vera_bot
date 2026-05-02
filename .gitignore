@@ -35,11 +35,11 @@ out/
 submission*.jsonl
 tick_parallel_response.json
 
-# Transient scratch
-_*.py
-_*.txt
-_*.json
-_*.log
+# Transient scratch (single leading underscore, not dunder)
+_[!_]*.py
+_[!_]*.txt
+_[!_]*.json
+_[!_]*.log
 smoke_*.py
 probe_*.py
 bench_*.py
