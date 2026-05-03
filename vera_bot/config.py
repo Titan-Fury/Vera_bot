@@ -32,9 +32,13 @@ TICK_ACTION_CAP = 20
 CONTEXT_PAYLOAD_CAP_BYTES = 500 * 1024
 DEFAULT_COMPOSE_TIMEOUT_S = 9.0
 JUDGE_CALL_TIMEOUT_S = 10.0
-# Per-tick concurrency cap. 6 keeps OpenRouter free tier happy while
-# letting precompute drain before the judge's first /v1/tick arrives.
-TICK_CONCURRENCY = int(os.environ.get("TICK_CONCURRENCY") or "6")
+# Per-tick concurrency cap. 2 is a free-tier-friendly default: lets
+# precompute drain without saturating Groq's 30 RPM pool on a 25-trigger
+# judge push. Override upward via env on a paid plan.
+TICK_CONCURRENCY = int(os.environ.get("TICK_CONCURRENCY") or "2")
+# Small jitter between precompute launches to spread upstream pressure when
+# the judge ingests many triggers in the same tick.
+PRECOMPUTE_STAGGER_MS = int(os.environ.get("PRECOMPUTE_STAGGER_MS") or "250")
 
 # ---- Self-critique (rubric-gated one-shot revision) -----------------------
 # When enabled, high-urgency (>=_THRESHOLD) LLM compositions are passed through

@@ -23,6 +23,7 @@ from ..config import (
     COMPOSER_VERSION,
     CONTEXT_PAYLOAD_CAP_BYTES,
     DEFAULT_COMPOSE_TIMEOUT_S,
+    PRECOMPUTE_STAGGER_MS,
     SETTINGS,
     TICK_ACTION_CAP,
     TICK_CONCURRENCY,
@@ -105,7 +106,32 @@ async def _schedule_precompute(trigger_id: str) -> None:
                     return
             except Exception:
                 pass
-        _compose_cache[trigger_id] = asyncio.create_task(_background_compose(trigger_id))
+        # Stagger precompute launches so a 25-trigger judge burst doesn't
+        # fire 25 upstream LLM calls in the same millisecond.
+        stagger_s = _next_precompute_delay()
+        _compose_cache[trigger_id] = asyncio.create_task(
+            _delayed_background_compose(trigger_id, stagger_s)
+        )
+
+
+# Simple monotonic counter gives each fresh precompute a larger delay than
+# the previous one — effectively a token-bucket without external state. Reset
+# whenever the cache is cleared so /v1/teardown returns us to a fresh rate.
+_precompute_launch_counter: int = 0
+
+
+def _next_precompute_delay() -> float:
+    """Return a staggered launch delay in seconds."""
+    global _precompute_launch_counter
+    _precompute_launch_counter += 1
+    stagger_s = (PRECOMPUTE_STAGGER_MS / 1000.0) * (_precompute_launch_counter % TICK_CONCURRENCY)
+    return stagger_s
+
+
+async def _delayed_background_compose(trigger_id: str, delay_s: float) -> Any:
+    if delay_s > 0:
+        await asyncio.sleep(delay_s)
+    return await _background_compose(trigger_id)
 
 
 def _now_iso() -> str:
@@ -492,6 +518,7 @@ async def reply(body: ReplyBody):
 @app.post("/v1/teardown")
 async def teardown():
     """Optional per spec §11 — clears all state. Idempotent."""
+    global _precompute_launch_counter
     await context_store.clear()
     await conversation_store.clear()
     async with _cache_lock:
@@ -499,6 +526,7 @@ async def teardown():
             if not task.done():
                 task.cancel()
         _compose_cache.clear()
+        _precompute_launch_counter = 0
     return {"ok": True, "cleared_at": _now_iso()}
 
 
