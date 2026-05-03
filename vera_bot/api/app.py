@@ -24,6 +24,7 @@ from ..config import (
     CONTEXT_PAYLOAD_CAP_BYTES,
     DEFAULT_COMPOSE_TIMEOUT_S,
     PRECOMPUTE_STAGGER_MS,
+    REPLY_COMPOSE_TIMEOUT_S,
     SETTINGS,
     TICK_ACTION_CAP,
     TICK_CONCURRENCY,
@@ -485,7 +486,7 @@ async def reply(body: ReplyBody):
                 body.turn_number,
                 body.from_role,
             ),
-            timeout=DEFAULT_COMPOSE_TIMEOUT_S,
+            timeout=REPLY_COMPOSE_TIMEOUT_S,
         )
     except asyncio.TimeoutError:
         logger.warning("reply: compose_reply timed out for conv=%s", body.conversation_id)

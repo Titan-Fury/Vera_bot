@@ -31,6 +31,11 @@ MAX_BODY_CHARS = 320
 TICK_ACTION_CAP = 20
 CONTEXT_PAYLOAD_CAP_BYTES = 500 * 1024
 DEFAULT_COMPOSE_TIMEOUT_S = 9.0
+# Reply composition has a separate (slightly larger) budget. Reply paths
+# include chat history + intent-specific prompts and can take an extra ~2s
+# vs a cold tick, but the judge's /v1/reply window is usually 15s so 12s is
+# safely inside the envelope.
+REPLY_COMPOSE_TIMEOUT_S = float(os.environ.get("REPLY_COMPOSE_TIMEOUT_S") or "12.0")
 JUDGE_CALL_TIMEOUT_S = 10.0
 # Per-tick concurrency cap. 2 is a free-tier-friendly default: lets
 # precompute drain without saturating Groq's 30 RPM pool on a 25-trigger

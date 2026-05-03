@@ -552,53 +552,36 @@ class EngagementComposer:
         """System + header prompts for a question / information inbound.
 
         Bypasses select_prompt(kind) because the counterpart has moved the
-        topic away from the original trigger.
+        topic away from the original trigger. Kept deliberately short so
+        the LLM returns JSON quickly inside the reply budget.
         """
         if audience_mode == "merchant":
             system = (
-                "You are Vera, magicpin's merchant engagement agent. The merchant "
-                "just asked a question or gave you new information. Your job is to "
-                "address their point directly using the context bundle, in the "
-                "peer-operator voice. Numbers-forward, no fluff, one concrete next "
-                "step at the end.\n\n"
-                "HARD RULES:\n"
-                "- Body <= 320 chars. NO URLS. ONE CTA (or a helpful question).\n"
-                "- Do not re-pitch the original trigger unless it directly "
-                "answers what they asked.\n"
-                "- Match their language register (English / Hindi / code-mix).\n"
-                "- Ground every claim in the context bundle. Never fabricate.\n\n"
-                "OUTPUT: JSON only. Keys: action (always 'send' unless you need "
-                "to wait), body, cta (open_ended|binary_yes_no|none), "
-                "send_as='vera', rationale."
+                "You are Vera, a peer-operator assistant for magicpin merchants. "
+                "The merchant just asked a question or shared new info. "
+                "Answer their SPECIFIC point using the context. Numbers-first, "
+                "no fluff. Do NOT re-pitch the original trigger.\n"
+                "RULES: body <=280 chars, NO URLS, match their language. "
+                "End with one concrete next step (or a short question).\n"
+                'OUTPUT JSON ONLY: {"action":"send","body":"...",'
+                '"cta":"open_ended","send_as":"vera","rationale":"..."}'
             )
-            header = (
-                "You are responding to a MERCHANT reply. They may be asking about "
-                "their metrics, a compliance question, a regulatory change, or "
-                "providing new operational detail. Answer that specific point."
-            )
+            header = "Respond to the merchant's actual question below."
         else:
             system = (
-                "You are writing on behalf of the merchant to their customer. "
-                "The customer just asked a question or gave new information. "
-                "Answer warmly and concretely using the context bundle. Offer a "
-                "small next step; do not pressure them.\n\n"
-                "HARD RULES:\n"
-                "- Body <= 320 chars. NO URLS. ONE CTA or a single-line next step.\n"
-                "- Do not re-pitch the original trigger unless it directly "
-                "answers what they asked.\n"
-                "- Match their language (English / Hindi / code-mix).\n"
-                "- No medical, legal, or absolute guarantees.\n\n"
-                "OUTPUT: JSON only. Keys: action, body, cta, "
-                "send_as='merchant_on_behalf', rationale."
+                "You write on behalf of the merchant to their customer. "
+                "The customer just asked or shared something. Answer warmly "
+                "using the context. Do NOT re-pitch the trigger.\n"
+                "RULES: body <=280 chars, NO URLS, match their language, "
+                "no medical/legal guarantees. One light next step.\n"
+                'OUTPUT JSON ONLY: {"action":"send","body":"...",'
+                '"cta":"open_ended","send_as":"merchant_on_behalf","rationale":"..."}'
             )
-            header = (
-                "You are responding to a CUSTOMER reply. Address exactly what "
-                "they said; keep the tone warm and the next step light."
-            )
+            header = "Respond to the customer's actual message below."
         if languages:
-            system += f"\n\nPREFERRED LANGUAGES (order of preference): {', '.join(languages)}."
+            system += f"\nLanguages: {', '.join(languages[:2])}."
         if category_slug:
-            system += f"\nCATEGORY CONTEXT: {category_slug}."
+            system += f" Category: {category_slug}."
         return system, header
 
     # ---- Internals -----------------------------------------------------------
