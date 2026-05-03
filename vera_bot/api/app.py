@@ -483,6 +483,7 @@ async def reply(body: ReplyBody):
                 chat_history,
                 body.message,
                 body.turn_number,
+                body.from_role,
             ),
             timeout=DEFAULT_COMPOSE_TIMEOUT_S,
         )

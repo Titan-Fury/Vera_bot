@@ -345,6 +345,84 @@ def detect_explicit_intent(message: str) -> bool:
     return any(re.search(p, m) for p in _INTENT_YES_PATTERNS)
 
 
+# ---- Intent classification for /v1/reply branching -------------------------
+#
+# The compose_reply path must branch on what the inbound message actually
+# says, not just on the original trigger kind. These are deliberately
+# conservative regex classifiers (no LLM call) so they add zero latency.
+
+_CONFIRM_PATTERNS = [
+    r"\bbook (?:me|it|that|the slot|an? appointment)\b",
+    r"\bhold (?:it|the slot|my slot)\b",
+    r"\bconfirm(?:ed)?\b",
+    r"\blet[''']?s do it\b",
+    r"\bgo ahead\b",
+    r"\bproceed\b",
+    r"\bdone\b",
+    r"\bschedule it\b",
+    r"\bplease book\b",
+    r"\bpakka\b",
+    r"\bkar do\b",
+    r"\bfix kar\b",
+    r"\btaiyaar\b",
+]
+
+# Interrogatives + signals that the user is ASKING something (not accepting).
+_QUESTION_PATTERNS = [
+    r"\?\s*$",                          # trailing question mark
+    r"^\s*(?:what|how|why|when|where|which|can you|could you|do you|does|is it|are there)\b",
+    r"\bhow (?:does|do|can|should|much|many|long)\b",
+    r"\bhelp (?:me|us|with)\b",
+    r"\bneed (?:help|advice|guidance|to know)\b",
+    r"\bquestion\b",
+    r"\btell me (?:about|more|how|why|what)\b",
+    r"\bexplain\b",
+    r"\bkaise\b",                       # "how" in Hindi
+    r"\bkya\b",                         # "what" in Hindi
+    r"\bbataao?\b",                     # "tell me"
+    r"\bsamjhao\b",                     # "explain"
+]
+
+# Signals the user is providing domain-specific information (changes topic).
+_INFORMATION_PATTERNS = [
+    r"\b(?:we|i|my|our)\s+(?:have|use|run|operate|own|prefer|currently)\b",
+    r"\b(?:using|running|stuck with|dealing with)\b",
+    r"\bissue(?:s)? (?:with|at|in|on)\b",
+    r"\bproblem (?:with|at|in|on)\b",
+    r"\bold (?:system|unit|setup|machine|equipment)\b",
+]
+
+
+def classify_reply_intent(message: str) -> str:
+    """Classify inbound into: confirm | question | continuation | unknown.
+
+    Order of checks matters: confirm wins over question, question over
+    information/continuation. Hard-no and auto-reply are classified upstream.
+    """
+    if not message or not message.strip():
+        return "unknown"
+    m = message.lower().strip()
+
+    # Short explicit yes ("yes", "ok", "sure") is confirmation, not continuation.
+    if len(m) <= 30 and any(re.search(p, m) for p in _INTENT_YES_PATTERNS):
+        # Distinguish "yes please book me for Wed 5 Nov, 6pm" (confirm w/ slot)
+        # from bare "yes" (also confirm).
+        return "confirm"
+
+    if any(re.search(p, m) for p in _CONFIRM_PATTERNS):
+        return "confirm"
+
+    if any(re.search(p, m) for p in _QUESTION_PATTERNS):
+        return "question"
+
+    if any(re.search(p, m) for p in _INFORMATION_PATTERNS):
+        # User is giving us context — treat as a question-shaped reply so the
+        # composer addresses what they said rather than re-pitching the trigger.
+        return "question"
+
+    return "continuation"
+
+
 def detect_auto_reply(user_messages: List[str]) -> bool:
     """Return True if we detect an auto-responder pattern in recent messages."""
     if not user_messages:
