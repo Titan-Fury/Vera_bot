@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from .store import ContextStore
+from .composer.features import compute_features, format_features_block
 
 
 @dataclass
@@ -181,5 +182,16 @@ def format_context_for_prompt(bundle: CompositionBundle | Dict[str, Any]) -> str
             )
         if cu.get("preferences"):
             lines.append(f"Preferences: {cu['preferences']}")
+
+    # Precomputed narrative features - judge-relevant derived facts the LLM
+    # should cite instead of recomputing from raw numbers (percentile rank,
+    # trend direction, retention gap, suggested offer, why-now window).
+    try:
+        feats = compute_features(b)
+        block = format_features_block(feats)
+        if block:
+            lines.append(block)
+    except Exception:  # never let feature-compute break composition
+        pass
 
     return "\n".join(lines)

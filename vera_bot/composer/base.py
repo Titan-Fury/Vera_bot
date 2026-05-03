@@ -10,8 +10,16 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ValidationError, field_validator
 
-from ..config import COMPOSER_VERSION
+from ..config import COMPOSER_VERSION, SELF_CRITIQUE_ENABLED, SELF_CRITIQUE_URGENCY_THRESHOLD
+from .critic import (
+    budget_deadline as _critic_budget_deadline,
+    build_revision_prompt as _build_revision_prompt,
+    critique as _critique,
+    min_axis_threshold as _critic_min_axis,
+    should_critique as _should_critique,
+)
 from .metrics import METRICS
+from .exemplars import format_exemplar_block, get_exemplar
 from .prompts import select_prompt
 from .providers.base import LLMProvider
 from .templates import try_template_compose
@@ -173,13 +181,38 @@ class EngagementComposer:
             kind, is_customer_facing, is_reply=False, category_slug=category_slug,
             languages=languages,
         )
-        user_prompt = f"{header}\n\nCompose the next WhatsApp message.\n\n{formatted_context}"
+        exemplar_body = get_exemplar(kind, is_customer_facing)
+        exemplar_block = format_exemplar_block(exemplar_body) if exemplar_body else ""
+        user_prompt = (
+            f"{header}\n\nCompose the next WhatsApp message."
+            f"{exemplar_block}\n\n{formatted_context}"
+        )
 
         comp = self._run(system_prompt, user_prompt,
                          fallback_send_as="merchant_on_behalf" if is_customer_facing else "vera")
         comp.send_as = comp.send_as or ("merchant_on_behalf" if is_customer_facing else "vera")
         if not comp.suppression_key:
             comp.suppression_key = f"{trigger_id}_{kind}"
+
+        # Self-critique gate: on high-urgency triggers only, score the draft
+        # against the challenge's own 5-axis rubric and trigger a bounded
+        # one-shot revision if any axis is weak. Strictly additive — any
+        # failure path returns the original draft untouched.
+        urgency = trigger.get("urgency")
+        if (
+            SELF_CRITIQUE_ENABLED
+            and comp.body
+            and "fallback" not in comp.flags
+            and _should_critique(urgency, SELF_CRITIQUE_URGENCY_THRESHOLD)
+        ):
+            self._maybe_revise(
+                comp=comp,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                formatted_context=formatted_context,
+                trigger_kind=kind,
+                t_compose_start=t_start,
+            )
 
         comp.body, report = validate_outbound(comp.body)
         comp.flags.extend(report.flags)
@@ -400,3 +433,68 @@ class EngagementComposer:
             rationale=f"[{COMPOSER_VERSION}] fallback composition (provider error)",
             flags=["fallback"],
         )
+
+    # ---- Self-critique revision (bounded, opt-in via config) ----------------
+
+    def _maybe_revise(
+        self,
+        *,
+        comp: Composition,
+        system_prompt: str,
+        user_prompt: str,
+        formatted_context: str,
+        trigger_kind: str,
+        t_compose_start: float,
+    ) -> None:
+        """Score draft vs rubric; rewrite once if any axis is weak. Never regresses."""
+        t_critic_start = time.perf_counter()
+        deadline = _critic_budget_deadline(t_critic_start)
+
+        draft = comp.body
+        result = _critique(
+            provider=self.provider,
+            body=draft,
+            formatted_context=formatted_context,
+            trigger_kind=trigger_kind,
+            deadline_s=deadline,
+        )
+        if result is None:
+            comp.flags.append("critique_skipped")
+            return
+
+        min_score = result.min_score
+        comp.flags.append(f"critique_min={min_score}")
+
+        if min_score >= _critic_min_axis():
+            # Draft is already strong enough.
+            return
+
+        # Budget check before spending another LLM call.
+        if time.perf_counter() >= deadline:
+            comp.flags.append("revision_skipped_budget")
+            return
+
+        revision_prompt = _build_revision_prompt(user_prompt, result, draft)
+        try:
+            revised = self._call_and_validate(system_prompt, revision_prompt, t_compose_start)
+        except Exception as e:  # pragma: no cover — defensive
+            logger.info("revision: provider error (%s)", type(e).__name__)
+            comp.flags.append("revision_error")
+            return
+
+        if revised is None or not (revised.body or "").strip():
+            comp.flags.append("revision_empty")
+            return
+
+        # Only accept revision if it looks like a real rewrite (not identical
+        # or near-identical to the draft) to avoid swapping body with itself.
+        if revised.body.strip() == draft.strip():
+            comp.flags.append("revision_identical")
+            return
+
+        comp.body = revised.body
+        if revised.cta:
+            comp.cta = revised.cta
+        if revised.send_as:
+            comp.send_as = revised.send_as
+        comp.flags.append("revised")

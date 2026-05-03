@@ -36,6 +36,16 @@ JUDGE_CALL_TIMEOUT_S = 10.0
 # letting precompute drain before the judge's first /v1/tick arrives.
 TICK_CONCURRENCY = int(os.environ.get("TICK_CONCURRENCY") or "6")
 
+# ---- Self-critique (rubric-gated one-shot revision) -----------------------
+# When enabled, high-urgency (>=_THRESHOLD) LLM compositions are passed through
+# a second cheap LLM call that scores the draft against the 5-axis rubric.
+# If any axis scores < ENABLE_MIN, a one-shot revision is requested. Bounded
+# by _BUDGET_S so we never push past DEFAULT_COMPOSE_TIMEOUT_S.
+SELF_CRITIQUE_ENABLED = (os.environ.get("SELF_CRITIQUE_ENABLED") or "1") == "1"
+SELF_CRITIQUE_URGENCY_THRESHOLD = int(os.environ.get("SELF_CRITIQUE_URGENCY_THRESHOLD") or "4")
+SELF_CRITIQUE_MIN_AXIS_SCORE = int(os.environ.get("SELF_CRITIQUE_MIN_AXIS_SCORE") or "6")
+SELF_CRITIQUE_BUDGET_S = float(os.environ.get("SELF_CRITIQUE_BUDGET_S") or "3.0")
+
 
 @dataclass(frozen=True)
 class Settings:

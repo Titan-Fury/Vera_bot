@@ -43,6 +43,19 @@ BANNED OPENERS (these cost Engagement points):
 - "Hey there!" with no follow-up specificity
 - "Did you know..." without a concrete number attached
 - Any greeting that stalls the fact past the first 10 characters
+
+JUDGING RUBRIC (your output is scored 0-10 on each axis; target 9+ everywhere):
+  1. SPECIFICITY        - verifiable numbers / dates / named sources in the body.
+  2. CATEGORY FIT       - voice.tone alignment; use vocab_allowed; avoid taboos.
+  3. MERCHANT FIT       - include the merchant name and one payload-specific fact
+                          (performance number, locality, signal, or offer).
+  4. TRIGGER RELEVANCE  - cite the "why now" window explicitly (days/%/deadline).
+  5. ENGAGEMENT         - one persuasion lever (loss aversion, scarcity, social
+                          proof, curiosity, reciprocity) + low-friction CTA.
+PENALTIES to avoid:
+  - Fabricating any data not present in the context bundle.
+  - Exposing internal slugs ("perf_dip", "6_month_cleaning") to the reader.
+  - Any URL. Any length >320 chars. Any taboo phrase from category.voice.
 """
 
 _AUDIENCE_MERCHANT = """
