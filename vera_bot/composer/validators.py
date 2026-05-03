@@ -106,9 +106,31 @@ def enforce_length(body: str, cap: int = MAX_BODY_CHARS) -> Tuple[str, Validatio
     return out, r
 
 
+# Empty quote / placeholder artifacts the LLM sometimes emits when it sees a
+# template slot in the prompt but can't fill it. Dropping these is safer than
+# leaving "Offer '' now" in a customer-facing body.
+_EMPTY_QUOTES_RE = re.compile(r"""\s['"‘’“”]\s*['"‘’“”]\s*""")
+_PLACEHOLDER_RE = re.compile(r"\{[a-zA-Z_][a-zA-Z0-9_]*\}")
+
+
+def strip_empty_artifacts(body: str) -> Tuple[str, ValidationReport]:
+    """Remove empty ''/""/{var} placeholder artifacts and collapse whitespace."""
+    r = ValidationReport()
+    new = _EMPTY_QUOTES_RE.sub(" ", body)
+    if new != body:
+        r.add("stripped_empty_quotes")
+    if _PLACEHOLDER_RE.search(new):
+        new = _PLACEHOLDER_RE.sub("", new)
+        r.add("stripped_placeholder")
+    new = re.sub(r"\s{2,}", " ", new).strip()
+    return new, r
+
+
 def validate_outbound(body: str) -> Tuple[str, ValidationReport]:
-    """Full pipeline: strip URLs, then enforce length."""
+    """Full pipeline: strip URLs, clean placeholders, then enforce length."""
     report = ValidationReport()
+    body, r0 = strip_empty_artifacts(body)
+    report.flags.extend(r0.flags)
     body, r1 = strip_urls(body)
     report.flags.extend(r1.flags)
     body, r2 = enforce_length(body)
