@@ -10,7 +10,12 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ValidationError, field_validator
 
-from ..config import COMPOSER_VERSION, SELF_CRITIQUE_ENABLED, SELF_CRITIQUE_URGENCY_THRESHOLD
+from ..config import (
+    COMPOSER_VERSION,
+    SELF_CRITIQUE_ENABLED,
+    SELF_CRITIQUE_MAX_COMPOSE_ELAPSED_S,
+    SELF_CRITIQUE_URGENCY_THRESHOLD,
+)
 from .critic import (
     budget_deadline as _critic_budget_deadline,
     build_revision_prompt as _build_revision_prompt,
@@ -447,6 +452,14 @@ class EngagementComposer:
         t_compose_start: float,
     ) -> None:
         """Score draft vs rubric; rewrite once if any axis is weak. Never regresses."""
+        # Hard gate: if initial compose already burned most of our budget, skip
+        # critique entirely. The outer /v1/tick wait_for is 9s; a second LLM
+        # call on top of a 5s first compose will regularly trip it.
+        elapsed_already = time.perf_counter() - t_compose_start
+        if elapsed_already >= SELF_CRITIQUE_MAX_COMPOSE_ELAPSED_S:
+            comp.flags.append(f"critique_skipped_slow_compose({elapsed_already:.1f}s)")
+            return
+
         t_critic_start = time.perf_counter()
         deadline = _critic_budget_deadline(t_critic_start)
 
