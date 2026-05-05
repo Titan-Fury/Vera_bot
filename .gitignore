@@ -35,9 +35,26 @@ out/
 submission*.jsonl
 tick_parallel_response.json
 
+# Delivery layer runtime data (opt-out lists, send audit log)
+data/*.jsonl
+!data/.gitkeep
+
 # Transient scratch (specific patterns only)
 smoke_*.py
 probe_*.py
 bench_*.py
 *.bak
 *.tmp
+
+# Personal / private documents (not part of the challenge submission)
+docs/retail_whatsapp_plan.pdf
+docs/client_explainer.pdf
+docs/ai_strategy.pdf
+docs/data_collection_checklist.pdf
+docs/possible_investments.pdf
+docs/RESUME_INTERVIEW_GUIDE.md
+docs/private/
+omnibot_monetization_plan.pdf
+make_omnibot_pdf.py
+plans/
+deployed_bot_output.json

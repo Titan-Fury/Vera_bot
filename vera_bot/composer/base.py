@@ -12,6 +12,8 @@ from pydantic import BaseModel, ValidationError, field_validator
 
 from ..config import (
     COMPOSER_VERSION,
+    CRITIC_NUM_DRAFTS,
+    CRITIC_V2_ENABLED,
     SELF_CRITIQUE_ENABLED,
     SELF_CRITIQUE_MAX_COMPOSE_ELAPSED_S,
     SELF_CRITIQUE_URGENCY_THRESHOLD,
@@ -21,6 +23,8 @@ from .critic import (
     build_revision_prompt as _build_revision_prompt,
     critique as _critique,
     min_axis_threshold as _critic_min_axis,
+    passes_quality_gate as _passes_quality_gate,
+    pick_best as _pick_best,
     should_critique as _should_critique,
 )
 from .metrics import METRICS
@@ -685,7 +689,14 @@ class EngagementComposer:
         trigger_kind: str,
         t_compose_start: float,
     ) -> None:
-        """Score draft vs rubric; rewrite once if any axis is weak. Never regresses."""
+        """Score draft vs rubric; rewrite once if any axis is weak. Never regresses.
+
+        v2 (CRITIC_V2_ENABLED=1) extensions:
+        - If CRITIC_NUM_DRAFTS > 1, generate additional drafts, critique each,
+          pick the highest-weighted-score one before deciding on revision.
+        - If the chosen draft's compliance axis is below CRITIC_COMPLIANCE_HARD_BLOCK,
+          suppress the body entirely (clear it; flag with 'compliance_block').
+        """
         # Hard gate: if initial compose already burned most of our budget, skip
         # critique entirely. The outer /v1/tick wait_for is 9s; a second LLM
         # call on top of a 5s first compose will regularly trip it.
@@ -697,22 +708,101 @@ class EngagementComposer:
         t_critic_start = time.perf_counter()
         deadline = _critic_budget_deadline(t_critic_start)
 
-        draft = comp.body
-        result = _critique(
-            provider=self.provider,
-            body=draft,
-            formatted_context=formatted_context,
-            trigger_kind=trigger_kind,
-            deadline_s=deadline,
-        )
-        if result is None:
+        original_draft = comp.body
+        # Collect candidate (body, send_as, cta) tuples + critiques.
+        # Index 0 is always the existing draft.
+        candidates: List[Dict[str, Any]] = [
+            {"body": original_draft, "send_as": comp.send_as, "cta": comp.cta}
+        ]
+
+        # v2 multi-draft: generate (CRITIC_NUM_DRAFTS - 1) additional drafts
+        # serially under the budget. We do this serially (not in parallel)
+        # because providers like Groq enforce strict RPM caps on free tier;
+        # parallel calls would trip rate limits in production.
+        if CRITIC_V2_ENABLED and CRITIC_NUM_DRAFTS > 1:
+            for i in range(CRITIC_NUM_DRAFTS - 1):
+                if time.perf_counter() >= deadline:
+                    comp.flags.append(f"multi_draft_budget_exhausted_at_{i+1}")
+                    break
+                try:
+                    extra = self._call_and_validate(
+                        system_prompt, user_prompt, t_compose_start
+                    )
+                except Exception as e:
+                    logger.info("multi_draft: provider error (%s)", type(e).__name__)
+                    comp.flags.append(f"multi_draft_error_{i+1}")
+                    break
+                if extra is None or not (extra.body or "").strip():
+                    continue
+                candidates.append({"body": extra.body, "send_as": extra.send_as, "cta": extra.cta})
+
+        # Critique every candidate body
+        critiques: List[Any] = []
+        for cand in candidates:
+            r = _critique(
+                provider=self.provider,
+                body=cand["body"],
+                formatted_context=formatted_context,
+                trigger_kind=trigger_kind,
+                deadline_s=deadline,
+            )
+            critiques.append(r)
+
+        # If we got zero usable critiques, fall back to original draft untouched.
+        if all(c is None for c in critiques):
             comp.flags.append("critique_skipped")
             return
 
-        min_score = result.min_score
-        comp.flags.append(f"critique_min={min_score}")
+        # Pick the best draft+critique pair. In v1 mode (single draft) this is
+        # trivially the only candidate. In v2 mode it's a real selection.
+        best_idx = 0
+        if CRITIC_V2_ENABLED and len(critiques) > 1:
+            # Find the index of the best non-None critique
+            best_critique = _pick_best(critiques)
+            if best_critique is not None:
+                for i, c in enumerate(critiques):
+                    if c is best_critique:
+                        best_idx = i
+                        break
+            comp.flags.append(f"multi_draft_picked={best_idx+1}of{len(candidates)}")
 
-        if min_score >= _critic_min_axis():
+        chosen = candidates[best_idx]
+        result = critiques[best_idx]
+
+        # If the best draft's critique is None (provider error on this one),
+        # fall back gracefully.
+        if result is None:
+            comp.flags.append("critique_skipped_chosen")
+            return
+
+        # Promote chosen draft into the composition (only matters in multi-draft mode).
+        if best_idx != 0:
+            comp.body = chosen["body"]
+            if chosen.get("send_as"):
+                comp.send_as = chosen["send_as"]
+            if chosen.get("cta"):
+                comp.cta = chosen["cta"]
+
+        # ---- Compliance hard-block (v2 only) -------------------------------
+        if CRITIC_V2_ENABLED and result.is_v2 and result.compliance_violation:
+            compl = result.scores.get("compliance", 0)
+            comp.flags.append(f"compliance_block_score={compl}")
+            comp.body = ""
+            comp.rationale = (
+                f"[{COMPOSER_VERSION}] suppressed by compliance hard-block "
+                f"(compliance={compl}, hint={result.fix_hint})"
+            )
+            return
+
+        # ---- Quality gate (v1: min, v2: weighted) --------------------------
+        if result.is_v2:
+            comp.flags.append(
+                f"critique_weighted={result.weighted_score:.1f}_min={result.min_score}"
+            )
+        else:
+            comp.flags.append(f"critique_min={result.min_score}")
+
+        if _passes_quality_gate(result):
             # Draft is already strong enough.
             return
 
@@ -721,10 +811,10 @@ class EngagementComposer:
             comp.flags.append("revision_skipped_budget")
             return
 
-        revision_prompt = _build_revision_prompt(user_prompt, result, draft)
+        revision_prompt = _build_revision_prompt(user_prompt, result, comp.body)
         try:
             revised = self._call_and_validate(system_prompt, revision_prompt, t_compose_start)
-        except Exception as e:  # pragma: no cover — defensive
+        except Exception as e:  # pragma: no cover - defensive
             logger.info("revision: provider error (%s)", type(e).__name__)
             comp.flags.append("revision_error")
             return
@@ -735,7 +825,7 @@ class EngagementComposer:
 
         # Only accept revision if it looks like a real rewrite (not identical
         # or near-identical to the draft) to avoid swapping body with itself.
-        if revised.body.strip() == draft.strip():
+        if revised.body.strip() == comp.body.strip():
             comp.flags.append("revision_identical")
             return
 

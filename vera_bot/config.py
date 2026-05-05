@@ -60,6 +60,24 @@ SELF_CRITIQUE_MAX_COMPOSE_ELAPSED_S = float(
     os.environ.get("SELF_CRITIQUE_MAX_COMPOSE_ELAPSED_S") or "4.0"
 )
 
+# ---- Critic v2 (additive upgrade, OFF by default for back-compat) ---------
+# When CRITIC_V2_ENABLED=1, the rubric expands to 7 axes (adds compliance and
+# conversion_clarity), uses per-trigger-kind weights instead of plain min,
+# and supports multi-draft pick-best. Off keeps v1 behavior so existing tests
+# remain green.
+CRITIC_V2_ENABLED = (os.environ.get("CRITIC_V2_ENABLED") or "0") == "1"
+# Multi-draft: generate N candidates in parallel, critique each, ship the best.
+# Default 1 = single-draft (v1 behavior). Set 3 for the recommended pick-best.
+CRITIC_NUM_DRAFTS = int(os.environ.get("CRITIC_NUM_DRAFTS") or "1")
+# Hard-block threshold for the compliance axis. If the chosen draft's
+# compliance score is below this, the body is suppressed entirely
+# (composition.body cleared, flag added). Protects WhatsApp number from bans.
+CRITIC_COMPLIANCE_HARD_BLOCK = int(os.environ.get("CRITIC_COMPLIANCE_HARD_BLOCK") or "5")
+# Weighted-score threshold for triggering rewrite in v2. Compared against the
+# weighted sum across active axes, scaled to 0-10. Replaces v1 plain-min check
+# only when CRITIC_V2_ENABLED=1.
+CRITIC_WEIGHTED_THRESHOLD = float(os.environ.get("CRITIC_WEIGHTED_THRESHOLD") or "6.5")
+
 
 @dataclass(frozen=True)
 class Settings:
