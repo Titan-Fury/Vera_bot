@@ -197,6 +197,55 @@ async def metrics_endpoint():
     return snap
 
 
+@app.get("/v1/health/delivery")
+async def delivery_health():
+    """Liveness + safety stats for the WhatsApp delivery layer.
+
+    Returns the configured provider, its health probe (Meta API for cloud
+    provider; static OK for console), and current safety-guard counters.
+    """
+    try:
+        from ..delivery import get_provider as _get_provider, get_safety_guard
+        provider = _get_provider()
+        guard = get_safety_guard()
+        return {
+            "provider": provider.health(),
+            "safety": guard.stats(),
+            "critic_v2_enabled": _critic_v2_enabled(),
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@app.post("/v1/optout")
+async def optout_endpoint(body: Dict[str, Any]):
+    """Add a recipient to the persistent opt-out list.
+
+    Body: {"recipient": "+919876543210", "reason": "user_request"}
+    Idempotent. Future delivery attempts to this recipient will be blocked
+    by SafetyGuard until the entry is manually removed from data/opt_out.jsonl.
+    """
+    recipient = (body.get("recipient") or "").strip()
+    if not recipient:
+        raise HTTPException(status_code=400, detail="recipient is required")
+    reason = (body.get("reason") or "user_request").strip()[:120]
+    try:
+        from ..delivery import get_safety_guard
+        get_safety_guard().opt_out_recipient(recipient, reason)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"opt-out write failed: {e}")
+    return {"ok": True, "recipient": recipient, "reason": reason}
+
+
+def _critic_v2_enabled() -> bool:
+    try:
+        from ..config import CRITIC_V2_ENABLED
+        return bool(CRITIC_V2_ENABLED)
+    except Exception:
+        return False
+
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     """Self-contained HTML operator dashboard. Auto-refreshes every 5s."""

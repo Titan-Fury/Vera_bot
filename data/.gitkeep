@@ -1,0 +1,8 @@
+# Runtime data directory.
+#
+# At runtime the delivery layer writes:
+#   data/opt_out.jsonl   - persistent opt-out list (one JSON per line)
+#   data/send_log.jsonl  - audit log of every delivery attempt
+#
+# These files are .gitignored. This .gitkeep exists so the directory ships
+# in the repo and the safety guards have somewhere to write on first run.
